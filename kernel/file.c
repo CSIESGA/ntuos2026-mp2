@@ -15,23 +15,33 @@
 #include "slab.h"
 
 struct devsw devsw[NDEV];
+
+// Keep the lock for ref-count synchronization, but remove the static file array.
 struct {
   struct spinlock lock;
-  struct file file[NFILE];
 } ftable;
- 
+
+// Required by the spec: the slab cache for struct file.
 struct kmem_cache *file_cache;
 
-void fileprint_metadata(void *f) {
-  struct file *file = (struct file *) f;
+void
+fileprint_metadata(void *f)
+{
+  struct file *file = (struct file *)f;
   printf("tp: %d, ref: %d, readable: %d, writable: %d, pipe: %p, ip: %p, off: %d, major: %d",
-         file->type, file->ref, file->readable, file->writable, file->pipe, file->ip, file->off, file->major);
+         file->type, file->ref, file->readable, file->writable,
+         file->pipe, file->ip, file->off, file->major);
 }
 
 void
 fileinit(void)
 {
   initlock(&ftable.lock, "ftable");
+
+  // Cache name must be exactly "file".
+  file_cache = kmem_cache_create("file", sizeof(struct file));
+  if(file_cache == 0)
+    panic("fileinit: kmem_cache_create failed");
 }
 
 // Allocate a file structure.
@@ -40,16 +50,19 @@ filealloc(void)
 {
   struct file *f;
 
+  if(file_cache == 0)
+    panic("filealloc: file_cache not initialized");
+
+  f = (struct file *)kmem_cache_alloc(file_cache);
+  if(f == 0)
+    return 0;
+
+  // Preserve original xv6 semantics: ref count starts at 1 under ftable.lock.
   acquire(&ftable.lock);
-  for(f = ftable.file; f < ftable.file + NFILE; f++){
-    if(f->ref == 0){
-      f->ref = 1;
-      release(&ftable.lock);
-      return f;
-    }
-  }
+  f->ref = 1;
   release(&ftable.lock);
-  return 0;
+
+  return f;
 }
 
 // Increment ref count for file f.
@@ -73,10 +86,13 @@ fileclose(struct file *f)
   acquire(&ftable.lock);
   if(f->ref < 1)
     panic("fileclose");
+
   if(--f->ref > 0){
     release(&ftable.lock);
     return;
   }
+
+  // Snapshot before returning object to slab.
   ff = *f;
   f->ref = 0;
   f->type = FD_NONE;
@@ -89,6 +105,11 @@ fileclose(struct file *f)
     iput(ff.ip);
     end_op();
   }
+
+  if(file_cache == 0)
+    panic("fileclose: file_cache not initialized");
+
+  kmem_cache_free(file_cache, f);
 }
 
 // Get metadata about file f.
@@ -168,7 +189,7 @@ filewrite(struct file *f, uint64 addr, int n)
 
       begin_op();
       ilock(f->ip);
-      if ((r = writei(f->ip, 1, addr + i, f->off, n1)) > 0)
+      if((r = writei(f->ip, 1, addr + i, f->off, n1)) > 0)
         f->off += r;
       iunlock(f->ip);
       end_op();
@@ -186,4 +207,3 @@ filewrite(struct file *f, uint64 addr, int n)
 
   return ret;
 }
-
